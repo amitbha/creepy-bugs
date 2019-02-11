@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 #coding=utf8
-
 """
 desc: 爬取TED网站中英双语演讲稿，并存为markdown文件
 author: amita
@@ -30,8 +29,19 @@ def retry_with_warning(exception):
     return isinstance(exception, requests.exceptions.HTTPError)
 
 
+def validate_filename(name):
+    """清除文件名中的非法字符
+    name (str): 文件名
+    Returns:
+        str: 合法文件名
+    """
+    pattern = r'[\\/:*?"<>|\r\n ]+'
+    new_name = re.sub(pattern, "_", name)
+    return new_name
+
+
 class Spider(object):
-    def __init__(self, old_urls="urls.txt"):
+    def __init__(self, old_urls="ted.urls.txt"):
         # awk '/^talk:/{print $2; nextfile}' *.md | sort -b urls.txt - | uniq
         self.session = requests.Session()
         self.header = {
@@ -47,7 +57,7 @@ class Spider(object):
         # with open("ua.txt", "r") as f:
         #     for ua in f: self.ua_pool.append(ua)
         self.re_meta = re.compile('"__INITIAL_DATA__": (.+)}\)', re.M)
-        self.store_path = 'ted_talks/'
+        self.store_path = 'ted.talks/'
         self.urls = set()
         self.hist = open(old_urls, 'r+')  # 已保存的talkId，防止重复爬取
         for line in self.hist:
@@ -195,14 +205,15 @@ class Spider(object):
             m = meta
             # 元数据
             meta_yaml = ("---", 
-                f"title: '{m['title']}'", f"speaker:",
-                f"- {m['speaker']}", f"date: {m['date']}",
-                f"event: {m['event']}", f"abstract: {m['abstract']}",
-                f"views: {m['views']}", f"tags: {m['tags']}",
-                f"rated: [{m['rated']}]", f"lang: zh-cn",
-                f"id: {m['id']}", f"talk: {m['talk']}",
-                f"link: '{m['link']}'", 
-                "---")
+                         f"title: '{m['title']}'", 
+                         f"speaker:",
+                         f"- {m['speaker']}", f"date: {m['date']}",
+                         f"event: {m['event']}", f"abstract: {m['abstract']}",
+                         f"views: {m['views']}", f"tags: {m['tags']}",
+                         f"rated: [{m['rated']}]", f"lang: zh-cn",
+                         f"id: {m['id']}", f"talk: {m['talk']}",
+                         f"link: '{m['link']}'", 
+                         "---")
             # 正文
             content = [
                 f"##### {m['date']} - {m['speaker']}",
@@ -218,11 +229,10 @@ class Spider(object):
             #~ print(meta_text, '\n', text)
 
             ep = lambda x: x.split()[-1]
-            title = m['title'].replace(' ', '_')
-            event = m['event'].replace(' ', '_')
             # [2013].为生命的终结做好准备.TED2013.md
-            filename = f"[{ep(m['date'])}].{title}.{event}.md"
-            with open(self.store_path + filename, 'w') as f:
+            name = f"[{ep(m['date'])}].{m['title']}.{m['event']}.md"
+            filename = self.store_path + validate_filename(name)
+            with open(filename, 'w') as f:
                 f.writelines([meta_text, '\n', text])
                 self.add_visited_url(m['talk'])
             return filename
@@ -239,7 +249,7 @@ class Spider(object):
                 subtitle = m['data']
                 meta = m
             self.output_md(meta, subtitle)
-            # break
+            break
 
 
 if __name__ == '__main__':
