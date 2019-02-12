@@ -1,0 +1,2 @@
+awk '/^talk:/{print $2; nextfile}' *.md | sort -b urls.txt - | uniq
+fd -e md -x awk -f ../rm_newline.awk {}
