@@ -49,7 +49,7 @@ class Spider(object):
             self.ua_pool = json.load(u)
             self.headers = json.load(h)
         self.re_meta = re.compile('"__INITIAL_DATA__": (.+)}\)', re.M)
-        self.store_path = 'ted.talks/'
+        self.store_path = 'talks/'
         self.urls = set()
         self.hist = open(old_urls, 'r+')  # 已保存的talkId，防止重复爬取
         for line in self.hist:
@@ -74,7 +74,7 @@ class Spider(object):
         Returns:
             pyquery obj or json: 网页内容
         """
-        time.sleep(randint(2, 5))  # 道德自觉
+        time.sleep(randint(3, 5))  # 道德自觉
         r = self.session.get(url, headers=self.headers[0])
         r.raise_for_status()  # 一般是触发了网站限制
         return r.json() if exp_json else pyq(r.text, parser='html')
@@ -155,8 +155,10 @@ class Spider(object):
             #~ pprint(v)
         return subtitle
 
-    def _extract_data(self, data):
+    def _extract_data(self, jsdata):
+        data = jsdata['talks'][0]
         meta = {
+            'title': data['title'],
             'speaker': data['speaker_name'],
             'abstract': data['description'],
             'duration': data['duration'],
@@ -165,18 +167,30 @@ class Spider(object):
             'tags': data['tags'],
             'id': data['id'],
             'talk': data['slug'],
+            'comments': 0,
+            'who': data['speakers'][0]['whotheyare'],
+            'uid': data['speakers'][0]['slug'],
         }
+        time = data['recorded_at']
+        meta['date'] = time[:time.find('T')]
+        meta['rated'] = ''
+        if "comments" in jsdata:
+            meta['comments'] = jsdata['comments']['count']
         for t in data['player_talks']:
             if t['id'] == meta['id']:
                 meta['pic'] = t['thumb']
                 if 'link' not in meta:
                     meta['link'] = t['canonical']
                 break
-        if not 'title' in meta:
-            meta['title'] = data['title']
-            time = data['recorded_at']
-            meta['date'] = time[:time.find('T')]
-            meta['rated'] = ''
+        meta['related_talks'] = []
+        for t in data['related_talks']:
+            talk = {
+                'id': t['id'],
+                'talk': t['slug'],
+                'speaker': t['speaker'],
+                'title': t['title'],
+            }
+            meta['related_talks'].append(talk)
         return meta
 
     def get_content(self, url):
@@ -190,10 +204,9 @@ class Spider(object):
         mjson = self.re_meta.search(page.text())
         mjson = mjson.group(1).replace("'", "")
         #~ print(mjson)
-        #~ mtdata = demjson.decode(mjson, strict=False)
         mtdata = json.loads(mjson)
         #~ pprint(mtdata['talks'])  # 数据相当全!
-        meta = self._extract_data(mtdata['talks'][0])
+        meta = self._extract_data(mtdata)
         #~ pprint(meta)
         subtitle = self.get_subtitle(meta['id'])
         return meta, subtitle
@@ -203,30 +216,42 @@ class Spider(object):
         if meta and data:
             m = meta
             # 元数据
-            meta_yaml = ("---",
-                         f"title: '{m['title']}'",
-                         f"speaker:",
+            meta_yaml = ("---", f"title: '{m['title']}'", f"speaker:",
                          f"- {m['speaker']}", f"date: {m['date']}",
                          f"event: {m['event']}", f"abstract: {m['abstract']}",
+                         f"duration: {m['duration']}",
                          f"views: {m['views']}", f"tags: {m['tags']}",
                          f"rated: [{m['rated']}]", f"lang: zh-cn",
                          f"id: {m['id']}", f"talk: {m['talk']}",
-                         f"link: '{m['link']}'",
-                         "---")
-            # 正文
+                         f"link: {m['link']}", "---")
+            # 抬头
             content = [
                 f"##### {m['date']} - {m['speaker']}",
-                f"# {m['title']}",
+                f"# [{m['title']}]({m['link']})",
+                f"观看数：{m['views']} | 话题：{'  '.join(m['tags'])} | 印象：{m['rated']}",
             ]
             if m['pic']:
                 content.append(f"![]({m['pic']})")
+            content.append(f"> {m['abstract']}")
+            # 正文
+            subt_pipe_table = ["|原文|翻译|", "| :----- | :----- |"]
             for zp, ep in zip(*data.values()):
-                content.append(zp)
-                content.append(f"> {ep}")
+                subt_pipe_table.append(f"| {ep} | {zp} |")
+            subt = '\n'.join(subt_pipe_table)
+            content.append(subt)
+            # 补充
+            speaker = f"> [**主讲人**](https://www.ted.com/speakers/{m['uid']})：{m['who']}"
+            if meta['related_talks']:
+                related = [f"#### 相关演讲："]
+                for i, t in enumerate(meta['related_talks']):
+                    url = urljoin(m['link'], t['talk'])
+                    related.append(f"{i+1}. [{t['title']}]({url}) - {t['speaker']}")
+                content.append("\n")
+                content.append("\n".join(related))
+
             meta_text = '\n'.join(meta_yaml)
             text = '\n\n'.join(content)
             #~ print(meta_text, '\n', text)
-
             ep = lambda x: x.split()[-1]
             # [2013].为生命的终结做好准备.TED2013.md
             name = f"[{ep(m['date'])}].{m['title']}.{m['event']}.md"
