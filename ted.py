@@ -3,7 +3,7 @@
 """
 desc: 爬取TED网站中英双语演讲稿，并存为markdown文件
 author: amita
-version: 1.5
+version: 1.8
 """
 
 import json
@@ -11,22 +11,17 @@ import re
 import time
 from functools import reduce
 from pprint import pprint
-from random import randint
+from random import choice, randint
 from urllib.parse import parse_qs, urljoin, urlparse
 
 #~ import yaml
 import requests
 from pyquery import PyQuery as pyq
-from retrying import retry
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from tenacity import *
 
-
-def retry_with_warning(exception):
-    """ 在危险的边缘试探，重试
-    Return True if we should retry
-    """
-    # HTTPError('429 Client Error: Rate Limited too many requests. for url: ...'
-    pprint(exception)
-    return isinstance(exception, requests.exceptions.HTTPError)
+# 禁用安全请求警告
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 
 def validate_filename(name):
@@ -41,61 +36,96 @@ def validate_filename(name):
 
 
 class Spider(object):
-    def __init__(self, old_urls="history.txt"):
+    def __init__(self, old_urls: str ="history.txt"):
         # awk '/^talk:/{print $2; nextfile}' *.md | sort -b urls.txt - | uniq
         self.session = requests.Session()
+        self.cfile = {
+            'ua': 'ua.json',
+            'header': 'headers.json',
+            'proxy': 'proxies.json',
+            'hist': old_urls
+        }
         self.referer_pattern = {}
-        with open('ua.json', 'r') as u, open('headers.json', 'r') as h:
-            self.ua_pool = json.load(u)
-            self.headers = json.load(h)
+        self.ua_pool = {}
+        self.headers = {}
+        self.proxies = {}
         self.re_meta = re.compile('"__INITIAL_DATA__": (.+)}\)', re.M)
         self.store_path = 'talks/'
         self.urls = set()
-        self.hist = open(old_urls, 'r+')  # 已保存的talkId，防止重复爬取
-        for line in self.hist:
-            id = line.strip()
-            if id: self.urls.add(id)
-        else:
-            # 检查文件是否以换行结尾
-            if not line.endswith('\n'):
-                self.hist.write('\n')
+        self.hist = None  # 已保存的talkId，防止重复爬取
+
+        self.load_config()
 
     def __del__(self):
         self.hist.close()
 
+    def load_config(self) -> None:
+        with open(self.cfile['ua'], 'r') as u, open(self.cfile['header'], 'r') as h:
+            self.ua_pool = json.load(u)
+            self.headers = json.load(h)
+        with open(self.cfile['proxy'], "r") as p:
+            self.proxies = json.load(p)
+        self.hist = open(self.cfile['hist'], 'r+')  # 已保存的talkId，防止重复爬取
+        for line in self.hist:
+            id = line.strip()
+            if id: self.urls.add(id)
+        else:
+            # 检查文件非空，以及是否以换行结尾
+            if 'line' in locals() and not line.endswith('\n'):
+                self.hist.write('\n')
+
+
+    # retry_on_result=retry_if_fail
     @retry(
-        wait_random_min=8000,
-        wait_random_max=60000,
-        retry_on_exception=retry_with_warning)
-    def request(self, url, exp_json=False):
+        stop=stop_after_attempt(6),
+        wait=wait_random(min=8, max=60),
+        # HTTPError('429 Client Error: Rate Limited too many requests. for url: ...'
+        retry=retry_if_exception_type(requests.exceptions.HTTPError))
+    def request(self, url: str, exp_json: bool =False) -> dict:
         """
         url (str): 网址
         exp_json (bool, optional): 是json请求
         Returns:
-            pyquery obj or json: 网页内容
+            PyQuery or json: 网页内容
         """
         time.sleep(randint(3, 5))  # 道德自觉
-        r = self.session.get(url, headers=self.headers[0])
-        r.raise_for_status()  # 一般是触发了网站限制
+        is_retry = self.request.retry.statistics['attempt_number'] > 1
+        proxy = self._get_proxy(is_retry)
+        r = self.session.get(
+            url,
+            headers=self.headers[0],
+            proxies=proxy,
+            verify=False,
+            timeout=10)
+        r.raise_for_status()  # 一般是触发了网站防护
+        # raise requests.exceptions.HTTPError("===test===")
         return r.json() if exp_json else pyq(r.text, parser='html')
 
-    def _get_id_from_url(self, url):
+    def _get_id_from_url(self, url: str) -> str:
         assert url.strip(), "invalid url!"
         up = urlparse(url, allow_fragments=False).path
         id_by_name = up.split('/')[-1]
         return id_by_name
 
-    def add_visited_url(self, url):
+    def _get_proxy(self, is_retry: bool =False) -> dict:
+        if is_retry and self.proxies:
+            self.proxies.setdefault('proxy', None)
+            proxy = choice(self.proxies['proxy'])
+            pprint(f"Trying proxy: {proxy} ...")
+            if proxy:
+                return {'http': proxy }
+
+    def add_visited_url(self, url: str):
         id_by_name = self._get_id_from_url(url)
         if not id_by_name in self.urls:
             self.urls.add(id_by_name)
             self.hist.writelines([id_by_name, '\n'])
 
-    def is_visited(self, url):
+    def is_visited(self, url: str) -> bool:
         id_by_name = self._get_id_from_url(url)
         return id_by_name in self.urls
 
-    def next_talk(self, url):
+    def next_talk(self, url: str) -> dict:
         """处理分页，获取所有资源链接
         url (str): 网址
         """
@@ -129,7 +159,7 @@ class Spider(object):
             print("The Last Page!!!")
 
     #~ https://www.ted.com/talks/1766/transcript.json?language=zh-cn
-    def get_subtitle(self, id):
+    def get_subtitle(self, id: str) -> dict:
         """下载演讲稿
         id (str): 演讲的id
         Returns:
@@ -155,7 +185,7 @@ class Spider(object):
             #~ pprint(v)
         return subtitle
 
-    def _extract_data(self, jsdata):
+    def _extract_data(self, jsdata: dict) -> dict:
         data = jsdata['talks'][0]
         meta = {
             'title': data['title'],
@@ -168,13 +198,16 @@ class Spider(object):
             'id': data['id'],
             'talk': data['slug'],
             'comments': 0,
-            'who': data['speakers'][0]['whotheyare'],
-            'uid': data['speakers'][0]['slug'],
+            'who': '',
+            'uid': ''
         }
+        if 'speakers' in data and data['speakers']:
+            meta['who'] = data['speakers'][0]['whotheyare']
+            meta['uid'] = data['speakers'][0]['slug']
         time = data['recorded_at']
         meta['date'] = time[:time.find('T')]
         meta['rated'] = ''
-        if "comments" in jsdata:
+        if "comments" in jsdata and jsdata['comments']:
             meta['comments'] = jsdata['comments']['count']
         for t in data['player_talks']:
             if t['id'] == meta['id']:
@@ -193,7 +226,7 @@ class Spider(object):
             meta['related_talks'].append(talk)
         return meta
 
-    def get_content(self, url):
+    def get_content(self, url: str):
         """获取资源页内容
         url (str): 网址
         Returns:
@@ -211,7 +244,7 @@ class Spider(object):
         subtitle = self.get_subtitle(meta['id'])
         return meta, subtitle
 
-    def output_md(self, meta, data):
+    def output_md(self, meta: dict, data: dict) -> str:
         #~ print(yaml.dump(meta, encoding='utf-8'))
         if meta and data:
             m = meta
@@ -219,11 +252,10 @@ class Spider(object):
             meta_yaml = ("---", f"title: '{m['title']}'", f"speaker:",
                          f"- {m['speaker']}", f"date: {m['date']}",
                          f"event: {m['event']}", f"abstract: {m['abstract']}",
-                         f"duration: {m['duration']}",
-                         f"views: {m['views']}", f"tags: {m['tags']}",
-                         f"rated: [{m['rated']}]", f"lang: zh-cn",
-                         f"id: {m['id']}", f"talk: {m['talk']}",
-                         f"link: {m['link']}", "---")
+                         f"duration: {m['duration']}", f"views: {m['views']}",
+                         f"tags: {m['tags']}", f"rated: [{m['rated']}]",
+                         f"lang: zh-cn", f"id: {m['id']}",
+                         f"talk: {m['talk']}", f"link: {m['link']}", "---")
             # 抬头
             content = [
                 f"##### {m['date']} - {m['speaker']}",
@@ -245,7 +277,8 @@ class Spider(object):
                 related = [f"#### 相关演讲："]
                 for i, t in enumerate(meta['related_talks']):
                     url = urljoin(m['link'], t['talk'])
-                    related.append(f"{i+1}. [{t['title']}]({url}) - {t['speaker']}")
+                    related.append(
+                        f"{i+1}. [{t['title']}]({url}) - {t['speaker']}")
                 content.append("\n")
                 content.append("\n".join(related))
 
@@ -261,7 +294,7 @@ class Spider(object):
                 self.add_visited_url(m['talk'])
             return filename
 
-    def run(self, start_url):
+    def run(self, start_url: str) -> None:
         u = urlparse(start_url)
         #~ pprint(u)
         if u.path.startswith('/talks/'):  # 单个talk
@@ -275,7 +308,7 @@ class Spider(object):
                 meta, subtitle = self.get_content(url)
                 meta.update(m)
                 self.output_md(meta, subtitle)
-                break
+                #break
 
 
 if __name__ == '__main__':
